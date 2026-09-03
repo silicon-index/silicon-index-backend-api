@@ -30,13 +30,42 @@ const CATEGORIES = ["CPU", "GPU", "RAM", "MOBO", "STORAGE"] as const;
 
 const TOOL_NAMES = ["search_components", "get_component", "score_fair_value", "detect_price_anomaly"] as const;
 
-async function loadComponents(env: ApiEnv): Promise<HardwareComponent[]> {
+interface ComponentIndex {
+  all: HardwareComponent[];
+  bySku: Map<string, HardwareComponent>;
+}
+
+/**
+ * Every tool call was independently re-fetching and re-normalizing the full
+ * catalogue from `database`'s upstream JSON, then doing an O(n) linear scan
+ * for a single SKU. Neither is necessary within a short window: the catalogue
+ * doesn't change second to second, and a single request often calls several
+ * tools in sequence (e.g. search_components then get_component on a result).
+ *
+ * `createMcpHandler` builds a fresh McpServer per HTTP request (correctly —
+ * that's what makes it stateless-safe), but the module-level cache below
+ * lives across requests within the same warm isolate/process, same as any
+ * other module-scoped `let` in a Worker or a long-running Bun process. A
+ * short TTL keeps it from ever serving meaningfully stale data.
+ */
+const CACHE_TTL_MS = 30_000;
+let cache: { index: ComponentIndex; expiresAt: number } | null = null;
+
+async function loadComponentIndex(env: ApiEnv): Promise<ComponentIndex> {
+  if (cache && cache.expiresAt > Date.now()) return cache.index;
+
   const response = await databaseApi.fetch(new Request("http://internal/components"), env);
   if (!response.ok) {
     throw new Error(`database module responded ${response.status}`);
   }
   const body = (await response.json()) as { components: HardwareComponent[] };
-  return body.components;
+
+  const bySku = new Map<string, HardwareComponent>();
+  for (const component of body.components) bySku.set(component.sku, component);
+
+  const index: ComponentIndex = { all: body.components, bySku };
+  cache = { index, expiresAt: Date.now() + CACHE_TTL_MS };
+  return index;
 }
 
 function summarize(component: HardwareComponent) {
@@ -69,7 +98,7 @@ function buildServer(env: ApiEnv): McpServer {
       })
     },
     async ({ query, category, manufacturer, limit }) => {
-      const components = await loadComponents(env);
+      const { all: components } = await loadComponentIndex(env);
       const q = query?.toLowerCase();
       const mfr = manufacturer?.toLowerCase();
       const matches = components
@@ -89,8 +118,8 @@ function buildServer(env: ApiEnv): McpServer {
       inputSchema: z.object({ sku: z.string() })
     },
     async ({ sku }) => {
-      const components = await loadComponents(env);
-      const match = components.find((c) => c.sku === sku);
+      const { bySku } = await loadComponentIndex(env);
+      const match = bySku.get(sku);
       if (!match) {
         return { content: [{ type: "text", text: `No component found for SKU "${sku}".` }], isError: true };
       }
@@ -107,8 +136,8 @@ function buildServer(env: ApiEnv): McpServer {
       inputSchema: z.object({ sku: z.string() })
     },
     async ({ sku }) => {
-      const components = await loadComponents(env);
-      const match = components.find((c) => c.sku === sku);
+      const { bySku } = await loadComponentIndex(env);
+      const match = bySku.get(sku);
       if (!match) {
         return { content: [{ type: "text", text: `No component found for SKU "${sku}".` }], isError: true };
       }
@@ -134,8 +163,8 @@ function buildServer(env: ApiEnv): McpServer {
       })
     },
     async ({ sku, reportedPrice, currency }) => {
-      const components = await loadComponents(env);
-      const match = components.find((c) => c.sku === sku);
+      const { bySku } = await loadComponentIndex(env);
+      const match = bySku.get(sku);
       if (!match) {
         return { content: [{ type: "text", text: `No component found for SKU "${sku}".` }], isError: true };
       }
